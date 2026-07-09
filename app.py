@@ -1,4 +1,3 @@
-%%writefile /Workspace/Users/kevin.lynch@locality.com/app.py
 import streamlit as st
 import requests
 
