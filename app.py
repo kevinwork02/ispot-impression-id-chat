@@ -31,7 +31,34 @@ def ask_agent(message: str) -> str:
         timeout=120,
     )
     resp.raise_for_status()
-    return resp.json().get("predictions", "No answer returned.")
+    data = resp.json()
+
+    # MLflow LangGraph agents return a nested structure — try each format
+    pred = data.get("predictions", data)
+
+    # Format 1: predictions is a plain string
+    if isinstance(pred, str):
+        return pred
+
+    # Format 2: predictions is a dict with a messages list (LangGraph)
+    if isinstance(pred, dict):
+        messages = pred.get("messages", [])
+        if messages:
+            return messages[-1].get("content", str(pred))
+
+    # Format 3: predictions is a list
+    if isinstance(pred, list) and pred:
+        item = pred[0]
+        if isinstance(item, str):
+            return item
+        if isinstance(item, dict):
+            messages = item.get("messages", [])
+            if messages:
+                return messages[-1].get("content", str(item))
+            return item.get("content", str(item))
+
+    # Fallback: show the raw response so we can debug
+    return str(data)
 
 
 # ---------------------------------------------------------------------------
