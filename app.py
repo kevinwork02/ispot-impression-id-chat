@@ -12,33 +12,19 @@ st.caption("Ask questions about Locality’s iSpot TV and digital ad impression 
 # Secrets (set these in Streamlit Cloud → Settings → Secrets)
 # ---------------------------------------------------------------------------
 HOST = st.secrets["DATABRICKS_HOST"].rstrip("/")
-CLIENT_ID = st.secrets["SP_CLIENT_ID"]
-CLIENT_SECRET = st.secrets["SP_CLIENT_SECRET"]
+TOKEN = st.secrets["DATABRICKS_TOKEN"]
 ENDPOINT = f"{HOST}/serving-endpoints/ispot-id-impressions-agent/invocations"
-TOKEN_URL = f"{HOST}/oidc/v1/token"
+
 
 # ---------------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------------
-def get_token() -> str:
-    """Mint a short-lived Databricks OAuth M2M token."""
-    resp = requests.post(
-        TOKEN_URL,
-        auth=(CLIENT_ID, CLIENT_SECRET),
-        data={"grant_type": "client_credentials", "scope": "all-apis"},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json()["access_token"]
-
-
 def ask_agent(message: str) -> str:
     """Send a message to the iSpot agent endpoint and return the answer."""
-    token = get_token()
     resp = requests.post(
         ENDPOINT,
         headers={
-            "Authorization": f"Bearer {token}",
+            "Authorization": f"Bearer {TOKEN}",
             "Content-Type": "application/json",
         },
         json={"messages": [{"role": "user", "content": message}]},
