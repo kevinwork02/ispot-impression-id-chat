@@ -18,34 +18,42 @@ WAREHOUSE_ID = "5e7f9a39557c84c1"
 LLM_ENDPOINT = f"{HOST}/serving-endpoints/databricks-meta-llama-3-3-70b-instruct/invocations"
 
 # ---------------------------------------------------------------------------
-# SQL generation prompt
+# Prompts
 # ---------------------------------------------------------------------------
-SQL_PROMPT = """You are a SQL expert. Generate a single valid Spark SQL SELECT statement for the table locality_dev.silver.ispot_streaming_impressions.
+SQL_PROMPT = """You are a SQL expert. Generate a single valid Spark SQL SELECT statement for
+the table locality_dev.silver.ispot_streaming_impressions.
 
 Table columns:
 - locality_hh_id (STRING): household ID
 - iuld_uuid (STRING): unique impression ID
-- advertiser_name (STRING): always 'CoxReps OTT Partner Integration' -- not a useful filter
+- advertiser_name (STRING): always 'CoxReps OTT Partner Integration' -- ignore as a filter
 - event_timestamp_utc (TIMESTAMP): event time UTC
-- media_market (STRING): geographic market e.g. 'Dallas--Fort Worth--Arlington, TX'
+- media_market (STRING): geographic media market e.g. 'Dallas--Fort Worth--Arlington, TX'
 - publisher_name_mapped (STRING): publisher name
-- device_category (STRING): IMPORTANT -- use 'television' (not 'CTV') for TV; other values: 'Other', 'desktop', 'smartphone', 'tablet', 'console'
+- device_category (STRING): use 'television' for TV (NOT 'CTV'); others: 'Other', 'desktop', 'smartphone', 'tablet', 'console'
 - data_date (DATE): date of record
 - ott_dsp (STRING): DSP name e.g. 'freewheel', 'tradedesk'
-- impression_date_pst (DATE): impression date PST -- preferred for date filters
+- impression_date_pst (DATE): preferred for date filters
 - delivery_date_pst (DATE): delivery date PST
 - ip_address (STRING): IP address
 
 Rules:
-- Use current_date() for today's date
-- For date ranges use impression_date_pst e.g. WHERE impression_date_pst >= date_sub(current_date(), 30)
-- For TV always filter device_category = 'television' never 'CTV'
-- For household exclusion use EXCEPT not NOT IN
-- Always include LIMIT 200 unless the query is a pure aggregate (COUNT, SUM etc.)
+1. Use current_date() for today. For date ranges use impression_date_pst >= date_sub(current_date(), N).
+2. For TV always use device_category = 'television', never 'CTV'.
+3. For household exclusion queries use EXCEPT, never NOT IN.
+4. If asked to LIST or SHOW items (e.g. 'list the markets', 'show publishers'), use SELECT DISTINCT or GROUP BY with ORDER BY -- do NOT add LIMIT.
+5. If asked for a count, percentage, or total, write a pure aggregate (no LIMIT needed).
+6. For all other queries add LIMIT 200.
 
-Return ONLY the SQL query. No explanation, no markdown fences."""
+Return ONLY the SQL. No explanation, no markdown fences."""
 
-SUMMARY_PROMPT = "You are a helpful data analyst at Locality. Summarize the following query results in 2-4 plain English sentences. Be specific with numbers. Do not mention SQL."
+SUMMARY_PROMPT = """You are a helpful data analyst at Locality. Given the user's question and SQL results, respond as follows:
+
+- If the question asks to LIST, SHOW, or ENUMERATE items (e.g. 'list the markets', 'show publishers', 'what markets are there'): reproduce ALL rows as a clean markdown table with column headers. Do not summarise -- show every row.
+- If the question asks for a TOP N: show the items as a numbered markdown list with their metric.
+- If the question asks for a count, total, percentage, or comparison: answer in 2-3 plain English sentences with specific numbers.
+
+Never say 'the data shows' or 'the results indicate'. Be direct and specific."""
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -66,13 +74,13 @@ def run_sql(query: str) -> str:
         f"{HOST}/api/2.0/sql/statements",
         headers={"Authorization": f"Bearer {TOKEN}"},
         json={"warehouse_id": WAREHOUSE_ID, "statement": query,
-              "wait_timeout": "30s", "on_wait_timeout": "CONTINUE",
+              "wait_timeout": "50s", "on_wait_timeout": "CONTINUE",
               "disposition": "INLINE", "format": "JSON_ARRAY"},
-        timeout=60,
+        timeout=90,
     )
     data = resp.json()
     sid = data.get("statement_id")
-    for _ in range(30):
+    for _ in range(40):
         state = data.get("status", {}).get("state", "")
         if state in ("SUCCEEDED", "FAILED", "CANCELED", "CLOSED"):
             break
@@ -86,8 +94,11 @@ def run_sql(query: str) -> str:
     rows = data.get("result", {}).get("data_array", [])
     if not rows:
         return "No results returned."
-    lines = ["  ".join(columns)] + ["  ".join(str(v) for v in row) for row in rows[:100]]
-    return "\n".join(lines)
+    # Return as markdown table so the LLM can reproduce it cleanly
+    header = "| " + " | ".join(columns) + " |"
+    sep = "| " + " | ".join(["---"] * len(columns)) + " |"
+    body = ["| " + " | ".join(str(v) if v is not None else "" for v in row) + " |" for row in rows]
+    return "\n".join([header, sep] + body)
 
 
 def answer(question: str) -> str:
@@ -95,7 +106,7 @@ def answer(question: str) -> str:
         sql = call_llm(SQL_PROMPT, question)
         sql = sql.strip().strip("`").replace("sql\n", "").strip()
         results = run_sql(sql)
-        return call_llm(SUMMARY_PROMPT, f"Question: {question}\n\nResults:\n{results}")
+        return call_llm(SUMMARY_PROMPT, f"Question: {question}\n\nData:\n{results}")
     except Exception as e:
         return f"Something went wrong: {e}"
 
@@ -106,7 +117,7 @@ def answer(question: str) -> str:
 EXAMPLES = [
     "How many total impressions have been delivered?",
     "What percentage came from TV vs other devices?",
-    "Which cities saw the most impressions in the last 30 days?",
+    "List all media markets",
     "What share of households were only reached through TV?",
     "Who are the top 5 publishers by impression volume?",
     "How does Freewheel compare to other DSPs?",
