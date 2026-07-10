@@ -20,42 +20,50 @@ LLM_ENDPOINT = f"{HOST}/serving-endpoints/databricks-meta-llama-3-3-70b-instruct
 # ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
-SQL_PROMPT = """You are a SQL expert. Generate a single valid Spark SQL SELECT statement for
-the table locality_dev.silver.ispot_streaming_impressions.
+SQL_PROMPT = """You are a SQL expert. The user may ask follow-up questions referring to previous results -- use the conversation history to understand what 'those households', 'that market', 'those publishers' etc. refer to, and build the correct WHERE clause.
+
+Generate a single valid Spark SQL SELECT statement for locality_dev.silver.ispot_streaming_impressions.
 
 Table columns:
 - locality_hh_id (STRING): household ID
 - iuld_uuid (STRING): unique impression ID
 - advertiser_name (STRING): always 'CoxReps OTT Partner Integration' -- ignore as a filter
 - event_timestamp_utc (TIMESTAMP): event time UTC
-- media_market (STRING): geographic media market e.g. 'Dallas--Fort Worth--Arlington, TX'
+- media_market (STRING): full DMA name e.g. 'Dallas--Fort Worth--Arlington, TX'
 - publisher_name_mapped (STRING): publisher name
 - device_category (STRING): see semantic mappings below
-- data_date (DATE): date of record
 - ott_dsp (STRING): DSP name e.g. 'freewheel', 'tradedesk'
 - impression_date_pst (DATE): preferred for date filters
 - delivery_date_pst (DATE): delivery date PST
-- ip_address (STRING): IP address
+- locality_hh_id (STRING): household identifier
 
-Semantic mappings -- ALWAYS apply these regardless of how the user phrases it:
-- 'TV', 'CTV', 'connected TV', 'television', 'big screen', 'OTT', 'streaming TV' -> device_category = 'television'
-- 'mobile', 'phone', 'cell', 'cellular' -> device_category = 'smartphone'
-- 'computer', 'laptop', 'PC', 'web' -> device_category = 'desktop'
-- 'tablet', 'iPad' -> device_category = 'tablet'
-- 'Freewheel', 'FW', 'free wheel' -> ott_dsp LIKE '%freewheel%'
-- 'Trade Desk', 'TTD', 'the trade desk' -> ott_dsp LIKE '%tradedesk%'
-- 'households', 'HH', 'homes', 'unique viewers' -> COUNT(DISTINCT locality_hh_id)
-- 'impressions', 'ads', 'spots', 'views' -> COUNT(*) or COUNT(DISTINCT iuld_uuid)
+Semantic mappings -- ALWAYS apply, no exceptions:
+- ANY of: 'TV', 'CTV', 'connected TV', 'television', 'big screen', 'OTT', 'streaming TV', 'broadcast TV', 'linear TV' -> device_category = 'television'
+- ANY of: 'mobile', 'phone', 'cell', 'cellular', 'handset' -> device_category = 'smartphone'
+- ANY of: 'computer', 'laptop', 'PC', 'web', 'browser' -> device_category = 'desktop'
+- ANY of: 'tablet', 'iPad' -> device_category = 'tablet'
+- ANY of: 'Freewheel', 'FW', 'free wheel' -> ott_dsp LIKE '%freewheel%'
+- ANY of: 'Trade Desk', 'TTD', 'the trade desk' -> ott_dsp LIKE '%tradedesk%'
+- ANY of: 'households', 'HH', 'homes', 'unique households', 'unique viewers', 'unique homes', 'addresses' -> COUNT(DISTINCT locality_hh_id) or DISTINCT locality_hh_id
+- ANY of: 'impressions', 'ads', 'spots', 'views', 'exposures', 'ad plays' -> COUNT(*) or COUNT(DISTINCT iuld_uuid)
 
 Rules:
-1. Use current_date() for today. For date ranges use impression_date_pst >= date_sub(current_date(), N).
-2. For household exclusion queries use EXCEPT, never NOT IN.
-3. If asked to LIST or SHOW items (e.g. 'list the markets', 'show publishers'), use SELECT DISTINCT or GROUP BY with ORDER BY -- do NOT add LIMIT.
-4. If asked for a count, percentage, or total, write a pure aggregate (no LIMIT needed).
-5. For all other queries add LIMIT 200.
-6. Named entity matching (markets, cities, publishers, DSPs): ALWAYS use LOWER(column) LIKE LOWER('%term%'). NEVER use exact equality. media_market stores full DMA names like 'Dallas--Fort Worth--Arlington, TX' so a search for 'Dallas' should use LOWER(media_market) LIKE '%dallas%'.
-7. For MULTIPLE time windows in one question (e.g. 'last 7 days and last 15 days', 'this week vs last month'): use a single SELECT with multiple COUNT expressions using FILTER, e.g. SELECT COUNT(*) FILTER (WHERE impression_date_pst >= date_sub(current_date(), 7)) AS last_7_days, COUNT(*) FILTER (WHERE impression_date_pst >= date_sub(current_date(), 15)) AS last_15_days FROM ... WHERE ...
-8. NEVER generate UNION, multiple statements, or subqueries when a single SELECT with FILTER or CASE WHEN will do.
+1. Use current_date() for today. For date ranges: impression_date_pst >= date_sub(current_date(), N).
+2. Named entity matching: ALWAYS use LOWER(column) LIKE LOWER('%term%'). NEVER exact equality for markets, cities, publishers, or DSPs. 'Dallas' -> LOWER(media_market) LIKE '%dallas%'.
+3. For EXCLUSIVE reach ('only reached through X', 'exclusively via X', 'TV-only households', 'only on mobile') use this EXACT CTE pattern:
+   WITH group_a AS (SELECT DISTINCT locality_hh_id FROM locality_dev.silver.ispot_streaming_impressions WHERE <condition_a> AND locality_hh_id IS NOT NULL),
+   group_b AS (SELECT DISTINCT locality_hh_id FROM locality_dev.silver.ispot_streaming_impressions WHERE <condition_b> AND locality_hh_id IS NOT NULL),
+   exclusive AS (SELECT locality_hh_id FROM group_a EXCEPT SELECT locality_hh_id FROM group_b)
+   SELECT COUNT(*) AS exclusive_hh_count FROM exclusive
+   For 'TV-only': condition_a = device_category = 'television', condition_b = device_category != 'television'.
+   NEVER use NOT IN for household exclusion -- it silently returns zero when NULLs are present.
+4. For MULTIPLE time windows ('last 7 days and last 15 days', 'this week vs last month'): use FILTER expressions in one SELECT:
+   SELECT COUNT(*) FILTER (WHERE impression_date_pst >= date_sub(current_date(), 7)) AS last_7_days,
+          COUNT(*) FILTER (WHERE impression_date_pst >= date_sub(current_date(), 15)) AS last_15_days
+   FROM locality_dev.silver.ispot_streaming_impressions WHERE ...
+5. For LIST/SHOW questions: SELECT DISTINCT or GROUP BY with ORDER BY, no LIMIT.
+6. For counts/percentages/totals: pure aggregate, no LIMIT.
+7. All other queries: LIMIT 200.
 
 Return ONLY the SQL. No explanation, no markdown fences."""
 
@@ -67,25 +75,29 @@ SUMMARY_PROMPT = """You are a helpful data analyst at Locality. Given the user's
 
 Never say 'the data shows' or 'the results indicate'. Be direct and specific."""
 
-CLARIFY_PROMPT = """You are a helpful data analyst. A user asked a question about ad impression data but the query returned no data or a count of zero.
+CLARIFY_PROMPT = """You are a helpful data analyst. A user asked a question about ad impression data but the query returned no data or zero.
 
-Your job:
-1. Never just say '0 results' or repeat the error -- always be conversational and helpful.
-2. Acknowledge the result warmly.
-3. Suggest that the name or term they used might not exactly match what's in the database.
-4. Give 1-2 concrete rephrasing suggestions based on the question (e.g. if they said 'Utica', suggest trying 'Utica-Rome' or just confirming Utica is in their target market list).
-5. End with a friendly question asking if they'd like to try a different phrasing or if they meant something else.
+IMPORTANT rules before suggesting alternatives:
+- device_category = 'television' is ALWAYS the correct value for TV/CTV/OTT. NEVER suggest 'broadcast', 'video', 'streaming' or any other value as an alternative for TV.
+- 'freewheel' and 'tradedesk' are ALWAYS the correct DSP values. Do not suggest alternatives.
+- Only suggest name/spelling alternatives for geographic markets (city names, DMA names) and publisher names -- those are free-text fields where names vary.
 
-Keep it to 3-4 sentences. Be warm, specific, and helpful."""
+Your response:
+1. If the question was a FOLLOW-UP (uses words like 'those', 'them', 'that', 'of those'): gently note that you may have lost the context from the previous question and ask them to restate it in full (e.g. 'Could you ask this as a complete question? For example: how many TV-only households were there in Dallas in the last 30 days?').
+2. If a geographic market or publisher name was used: suggest it might be stored under a slightly different DMA name, and invite them to first ask 'list all media markets' to find the exact name.
+3. For all other cases: ask if they meant something slightly different and invite a rephrasing.
+
+Be warm, concise (2-3 sentences), and never suggest wrong technical alternatives."""
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def call_llm(system: str, user: str) -> str:
+def call_llm(system: str, messages: list) -> str:
+    """Call LLM with a system prompt and a list of {role, content} messages."""
     resp = requests.post(
         LLM_ENDPOINT,
         headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
-        json={"messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]},
+        json={"messages": [{"role": "system", "content": system}] + messages},
         timeout=60,
     )
     resp.raise_for_status()
@@ -144,39 +156,45 @@ def is_empty_or_zero(results: str) -> bool:
     return False
 
 
-def generate_sql(question: str) -> str:
-    sql = call_llm(SQL_PROMPT, question)
-    return sql.strip().strip("`").replace("sql\n", "").strip()
+def clean_sql(raw: str) -> str:
+    return raw.strip().strip("`").replace("sql\n", "").replace("```", "").strip()
 
 
-def answer(question: str) -> str:
+def answer(question: str, history: list) -> str:
+    """history is a list of {role, content} dicts representing the conversation so far."""
+    # Include last 6 messages (3 turns) so follow-up questions have context
+    context = history[-6:]
+    current = context + [{"role": "user", "content": question}]
+
     try:
-        # Step 1: Generate SQL
-        sql = generate_sql(question)
+        # Step 1: Generate SQL with full conversation context
+        sql = clean_sql(call_llm(SQL_PROMPT, current))
         results = run_sql(sql)
 
-        # Step 2: If SQL failed, retry once with the error as context
+        # Step 2: Retry once if SQL failed
         if results.startswith("Query failed:"):
-            sql = call_llm(
-                SQL_RETRY_PROMPT,
-                f"Original question: {question}\nFailed SQL:\n{sql}\nError: {results}"
-            )
-            sql = sql.strip().strip("`").replace("sql\n", "").strip()
+            retry_messages = current + [
+                {"role": "user", "content": f"That SQL failed: {results}\nPlease fix and return only the corrected SQL."}
+            ]
+            sql = clean_sql(call_llm(SQL_PROMPT, retry_messages))
             results = run_sql(sql)
 
-        # Step 3: If still failing after retry, show a friendly technical message
+        # Step 3: Still failing -- friendly message
         if results.startswith("Query failed:"):
-            return "I had trouble generating a valid query for that question. Could you try rephrasing it? For example, instead of asking for two time windows at once, try asking for each separately."
+            return "I had trouble building a valid query for that. Could you try rephrasing it? For example, break it into two separate questions if you're asking about multiple time windows."
 
-        # Step 4: If genuinely zero results, ask for clarification
+        # Step 4: Zero/empty -- ask for clarification with context
         if is_empty_or_zero(results):
             return call_llm(
                 CLARIFY_PROMPT,
-                f"User question: {question}\nSQL generated: {sql}\nResult: {results}"
+                [{"role": "user", "content": f"Conversation so far:\n{history}\n\nLatest question: {question}\nSQL used: {sql}\nResult: {results}"}]
             )
 
-        # Step 5: Summarise good results
-        return call_llm(SUMMARY_PROMPT, f"Question: {question}\n\nData:\n{results}")
+        # Step 5: Good results -- summarise with context
+        return call_llm(
+            SUMMARY_PROMPT,
+            [{"role": "user", "content": f"Question: {question}\n\nData:\n{results}"}]
+        )
     except Exception as e:
         return f"Something went wrong: {e}"
 
@@ -220,6 +238,8 @@ if prompt:
         st.markdown(prompt)
     with st.chat_message("assistant"):
         with st.spinner("Looking that up..."):
-            reply = answer(prompt)
+            # Pass all prior messages as history so follow-ups have context
+            history = st.session_state.messages[:-1]
+            reply = answer(prompt, history)
         st.markdown(reply)
     st.session_state.messages.append({"role": "assistant", "content": reply})
