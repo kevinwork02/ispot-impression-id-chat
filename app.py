@@ -54,6 +54,8 @@ Rules:
 4. If asked for a count, percentage, or total, write a pure aggregate (no LIMIT needed).
 5. For all other queries add LIMIT 200.
 6. Named entity matching (markets, cities, publishers, DSPs): ALWAYS use LOWER(column) LIKE LOWER('%term%'). NEVER use exact equality. media_market stores full DMA names like 'Dallas--Fort Worth--Arlington, TX' so a search for 'Dallas' should use LOWER(media_market) LIKE '%dallas%'.
+7. For MULTIPLE time windows in one question (e.g. 'last 7 days and last 15 days', 'this week vs last month'): use a single SELECT with multiple COUNT expressions using FILTER, e.g. SELECT COUNT(*) FILTER (WHERE impression_date_pst >= date_sub(current_date(), 7)) AS last_7_days, COUNT(*) FILTER (WHERE impression_date_pst >= date_sub(current_date(), 15)) AS last_15_days FROM ... WHERE ...
+8. NEVER generate UNION, multiple statements, or subqueries when a single SELECT with FILTER or CASE WHEN will do.
 
 Return ONLY the SQL. No explanation, no markdown fences."""
 
@@ -122,12 +124,19 @@ def run_sql(query: str) -> str:
     return "\n".join([header, sep] + body)
 
 
+SQL_RETRY_PROMPT = """The SQL query below failed with an error. Fix it and return only the corrected SQL query.
+No explanation, no markdown fences."""
+
+
 def is_empty_or_zero(results: str) -> bool:
-    """Detect when SQL returned no data or a single aggregate of zero."""
+    """Detect when SQL returned genuinely empty results or a single aggregate of zero."""
     if results == "No results returned.":
         return True
-    lines = [l for l in results.strip().split("\n") if l.strip() and not l.startswith("|".ljust(3, "-"))]
-    data_lines = [l for l in lines if l.startswith("|") and "---" not in l][1:]  # skip header
+    # Parse markdown table rows, skip header and separator
+    data_lines = [
+        l for l in results.strip().split("\n")
+        if l.startswith("|") and "---" not in l
+    ][1:]  # [1:] skips header row
     if len(data_lines) == 1:
         values = [v.strip() for v in data_lines[0].strip("|").split("|")]
         if all(v in ("0", "0.0", "", "null", "None") for v in values):
@@ -135,18 +144,38 @@ def is_empty_or_zero(results: str) -> bool:
     return False
 
 
+def generate_sql(question: str) -> str:
+    sql = call_llm(SQL_PROMPT, question)
+    return sql.strip().strip("`").replace("sql\n", "").strip()
+
+
 def answer(question: str) -> str:
     try:
-        sql = call_llm(SQL_PROMPT, question)
-        sql = sql.strip().strip("`").replace("sql\n", "").strip()
+        # Step 1: Generate SQL
+        sql = generate_sql(question)
         results = run_sql(sql)
 
-        if results.startswith("Query failed:") or is_empty_or_zero(results):
+        # Step 2: If SQL failed, retry once with the error as context
+        if results.startswith("Query failed:"):
+            sql = call_llm(
+                SQL_RETRY_PROMPT,
+                f"Original question: {question}\nFailed SQL:\n{sql}\nError: {results}"
+            )
+            sql = sql.strip().strip("`").replace("sql\n", "").strip()
+            results = run_sql(sql)
+
+        # Step 3: If still failing after retry, show a friendly technical message
+        if results.startswith("Query failed:"):
+            return "I had trouble generating a valid query for that question. Could you try rephrasing it? For example, instead of asking for two time windows at once, try asking for each separately."
+
+        # Step 4: If genuinely zero results, ask for clarification
+        if is_empty_or_zero(results):
             return call_llm(
                 CLARIFY_PROMPT,
                 f"User question: {question}\nSQL generated: {sql}\nResult: {results}"
             )
 
+        # Step 5: Summarise good results
         return call_llm(SUMMARY_PROMPT, f"Question: {question}\n\nData:\n{results}")
     except Exception as e:
         return f"Something went wrong: {e}"
